@@ -23,6 +23,8 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -30,6 +32,15 @@ import java.util.concurrent.TimeUnit;
 public class TagMapper {
     private static final Gson GSON = (new GsonBuilder()).setPrettyPrinting().disableHtmlEscaping().create();
     private static final Map<String, String> TAG_TO_ITEM_MAP = new HashMap<>();
+
+    // Guards every read-modify-write of cucumber-tags.json, and of TAG_TO_ITEM_MAP, so that
+    // concurrent calls to getItemForTag() during parallel recipe/data loading can no longer
+    // race each other. Previously, two threads could each open an independent FileWriter on
+    // the same file at (nearly) the same time - FileWriter truncates on open with no locking -
+    // and their writes could interleave, producing malformed JSON (e.g. a stray trailing '}'
+    // left over from one writer's buffered tail landing after the other writer's shorter,
+    // already-complete content).
+    private static final Object FILE_LOCK = new Object();
 
     @SubscribeEvent
     public void onTagsUpdated(TagsUpdatedEvent event) {
@@ -41,53 +52,55 @@ public class TagMapper {
         var stopwatch = Stopwatch.createStarted();
         var dir = FMLPaths.CONFIGDIR.get().toFile();
 
-        TAG_TO_ITEM_MAP.clear();
+        synchronized (FILE_LOCK) {
+            TAG_TO_ITEM_MAP.clear();
 
-        if (dir.exists() && dir.isDirectory()) {
-            var file = FMLPaths.CONFIGDIR.get().resolve("cucumber-tags.json").toFile();
+            if (dir.exists() && dir.isDirectory()) {
+                var file = FMLPaths.CONFIGDIR.get().resolve("cucumber-tags.json").toFile();
 
-            if (file.exists() && file.isFile()) {
-                JsonObject json;
-                FileReader reader = null;
+                if (file.exists() && file.isFile()) {
+                    JsonObject json;
+                    FileReader reader = null;
 
-                try {
-                    var parser = new JsonParser();
-                    reader = new FileReader(file);
-                    json = parser.parse(reader).getAsJsonObject();
+                    try {
+                        var parser = new JsonParser();
+                        reader = new FileReader(file);
+                        json = parser.parse(reader).getAsJsonObject();
 
-                    json.entrySet().stream().filter(e -> {
-                        var value = e.getValue().getAsString();
-                        return !"__comment".equalsIgnoreCase(e.getKey()) && !value.isEmpty() && !"null".equalsIgnoreCase(value);
-                    }).forEach(entry -> {
-                        var tagId = entry.getKey();
-                        var itemId = entry.getValue().getAsString();
+                        json.entrySet().stream().filter(e -> {
+                            var value = e.getValue().getAsString();
+                            return !"__comment".equalsIgnoreCase(e.getKey()) && !value.isEmpty() && !"null".equalsIgnoreCase(value);
+                        }).forEach(entry -> {
+                            var tagId = entry.getKey();
+                            var itemId = entry.getValue().getAsString();
 
-                        TAG_TO_ITEM_MAP.put(tagId, itemId);
+                            TAG_TO_ITEM_MAP.put(tagId, itemId);
 
-                        // if auto refresh tag entries is enabled, we check any entries that contain an item ID to see
-                        // if they are still present. if not we just refresh the entry
-                        if (ModConfigs.AUTO_REFRESH_TAG_ENTRIES.get()) {
-                            if (!itemId.isEmpty() && !"null".equalsIgnoreCase(itemId)) {
-                                var item = ForgeRegistries.ITEMS.getValue(new ResourceLocation(itemId));
-                                if (item == null || item == Items.AIR) {
-                                    addTagToFile(tagId, json, file, false);
+                            // if auto refresh tag entries is enabled, we check any entries that contain an item ID to see
+                            // if they are still present. if not we just refresh the entry
+                            if (ModConfigs.AUTO_REFRESH_TAG_ENTRIES.get()) {
+                                if (!itemId.isEmpty() && !"null".equalsIgnoreCase(itemId)) {
+                                    var item = ForgeRegistries.ITEMS.getValue(new ResourceLocation(itemId));
+                                    if (item == null || item == Items.AIR) {
+                                        addTagToFile(tagId, json, file, false);
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
 
-                    // save changes to disk if refresh is enabled
-                    if (ModConfigs.AUTO_REFRESH_TAG_ENTRIES.get())
-                        saveToFile(json, file);
+                        // save changes to disk if refresh is enabled
+                        if (ModConfigs.AUTO_REFRESH_TAG_ENTRIES.get())
+                            saveToFile(json, file);
 
-                    reader.close();
-                } catch (Exception e) {
-                    Cucumber.LOGGER.error("An error occurred while reading cucumber-tags.json", e);
-                } finally {
-                    IOUtils.closeQuietly(reader);
+                        reader.close();
+                    } catch (Exception e) {
+                        Cucumber.LOGGER.error("An error occurred while reading cucumber-tags.json", e);
+                    } finally {
+                        IOUtils.closeQuietly(reader);
+                    }
+                } else {
+                    generateNewConfig(file);
                 }
-            } else {
-                generateNewConfig(file);
             }
         }
 
@@ -102,45 +115,47 @@ public class TagMapper {
             return preferredItem;
         }
 
-        if (TAG_TO_ITEM_MAP.containsKey(tagId)) {
-            var id = TAG_TO_ITEM_MAP.get(tagId);
-            return ForgeRegistries.ITEMS.getValue(new ResourceLocation(id));
-        } else {
-            var file = FMLPaths.CONFIGDIR.get().resolve("cucumber-tags.json").toFile();
-            if (!file.exists()) {
-                generateNewConfig(file);
-            }
-
-            if (file.isFile()) {
-                JsonObject json = null;
-                FileReader reader = null;
-
-                try {
-                    var parser = new JsonParser();
-                    reader = new FileReader(file);
-                    json = parser.parse(reader).getAsJsonObject();
-                } catch (Exception e) {
-                    Cucumber.LOGGER.error("An error occurred while reading cucumber-tags.json", e);
-                } finally {
-                    IOUtils.closeQuietly(reader);
+        synchronized (FILE_LOCK) {
+            if (TAG_TO_ITEM_MAP.containsKey(tagId)) {
+                var id = TAG_TO_ITEM_MAP.get(tagId);
+                return ForgeRegistries.ITEMS.getValue(new ResourceLocation(id));
+            } else {
+                var file = FMLPaths.CONFIGDIR.get().resolve("cucumber-tags.json").toFile();
+                if (!file.exists()) {
+                    generateNewConfig(file);
                 }
 
-                if (json != null) {
-                    if (json.has(tagId)) {
-                        var itemId = json.get(tagId).getAsString();
-                        if (itemId.isEmpty() || "null".equalsIgnoreCase(itemId))
-                            return addTagToFile(tagId, json, file);
+                if (file.isFile()) {
+                    JsonObject json = null;
+                    FileReader reader = null;
 
-                        TAG_TO_ITEM_MAP.put(tagId, itemId);
-
-                        return ForgeRegistries.ITEMS.getValue(new ResourceLocation(itemId));
+                    try {
+                        var parser = new JsonParser();
+                        reader = new FileReader(file);
+                        json = parser.parse(reader).getAsJsonObject();
+                    } catch (Exception e) {
+                        Cucumber.LOGGER.error("An error occurred while reading cucumber-tags.json", e);
+                    } finally {
+                        IOUtils.closeQuietly(reader);
                     }
 
-                    return addTagToFile(tagId, json, file);
-                }
-            }
+                    if (json != null) {
+                        if (json.has(tagId)) {
+                            var itemId = json.get(tagId).getAsString();
+                            if (itemId.isEmpty() || "null".equalsIgnoreCase(itemId))
+                                return addTagToFile(tagId, json, file);
 
-            return Items.AIR;
+                            TAG_TO_ITEM_MAP.put(tagId, itemId);
+
+                            return ForgeRegistries.ITEMS.getValue(new ResourceLocation(itemId));
+                        }
+
+                        return addTagToFile(tagId, json, file);
+                    }
+                }
+
+                return Items.AIR;
+            }
         }
     }
 
@@ -149,6 +164,8 @@ public class TagMapper {
         return item != null && item != Items.AIR ? new ItemStack(item, size) : ItemStack.EMPTY;
     }
 
+    // Every caller of this method already holds FILE_LOCK (via getItemForTag() or
+    // reloadTagMappings()), so the read-modify-write of `json` and TAG_TO_ITEM_MAP below is safe.
     private static Item addTagToFile(String tagId, JsonObject json, File file) {
         return addTagToFile(tagId, json, file, true);
     }
@@ -185,22 +202,38 @@ public class TagMapper {
         return item;
     }
 
+    // Writes atomically: the JSON is written to a sibling temp file first, then moved into place
+    // with an atomic, same-filesystem rename. A reader can therefore never observe a truncated or
+    // half-written cucumber-tags.json, and two overlapping writers can no longer interleave their
+    // output onto the same file - whichever rename completes last simply wins outright, instead of
+    // both writers truncating and writing into the same file handle at once.
+    //
+    // Combined with FILE_LOCK above (which also serializes writers against each other within this
+    // JVM), this closes the race that produced the corrupted file (valid JSON followed by a stray
+    // trailing '}').
     private static void saveToFile(JsonObject json, File file) {
-        try (var writer = new FileWriter(file)) {
+        var tempFile = new File(file.getParentFile(), file.getName() + ".tmp");
+
+        try (var writer = new FileWriter(tempFile)) {
             GSON.toJson(json, writer);
         } catch (IOException e) {
             Cucumber.LOGGER.error("An error occurred while writing to cucumber-tags.json", e);
+            return;
+        }
+
+        try {
+            Files.move(tempFile.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            Cucumber.LOGGER.error("An error occurred while replacing cucumber-tags.json", e);
         }
     }
 
     private static void generateNewConfig(File file) {
-        try (var writer = new FileWriter(file)) {
-            var object = new JsonObject();
-            object.addProperty("__comment", "Instructions: https://blakesmods.com/docs/cucumber/tags-config");
+        var object = new JsonObject();
+        object.addProperty("__comment", "Instructions: https://blakesmods.com/docs/cucumber/tags-config");
 
-            GSON.toJson(object, writer);
-        } catch (IOException e) {
-            Cucumber.LOGGER.error("An error occurred while creating cucumber-tags.json", e);
-        }
+        // Routed through saveToFile() so config generation also benefits from the atomic
+        // write-then-rename above, instead of writing directly with a truncating FileWriter.
+        saveToFile(object, file);
     }
 }
